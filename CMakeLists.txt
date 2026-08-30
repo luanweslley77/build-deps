@@ -95,8 +95,10 @@ endif()
 
 if(FREEBSD)
     set(MAKE_FIND_NAMES "gmake")  # We get invalid line types in nv-codec-headers Makefile if we use BSD make
-else()
+elseif(WIN32)
     set(MAKE_FIND_NAMES "mingw32-make;make;gmake")
+else()
+    set(MAKE_FIND_NAMES "make;gmake")
 endif()
 
 find_program(MAKE_EXECUTABLE

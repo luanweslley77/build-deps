@@ -16,38 +16,96 @@ if(BUILD_FFMPEG_ALL_PATCHES OR BUILD_FFMPEG_X265_PATCHES)
     endforeach()
 endif()
 
-# options for x265
-set(ENABLE_CLI OFF CACHE BOOL "Enable CLI")
-set(ENABLE_SHARED OFF CACHE BOOL "Enable shared libraries")
-set(STATIC_LINK_CRT ON CACHE BOOL "Static link CRT")
-
-# not currently supported for aarch64
-if(${arch} STREQUAL "amd64" OR ${arch} STREQUAL "x86_64")
-    set(ENABLE_HDR10_PLUS ON CACHE BOOL "Enable HDR10+ support")
-endif()
-
 # ensure x265 installs into the ffmpeg prefix
 set(_original_cmake_install_prefix ${CMAKE_INSTALL_PREFIX})
 set(CMAKE_INSTALL_PREFIX ${FFMPEG_INSTALL_PREFIX})
 
-# build x265
-add_subdirectory(${X265_GENERATED_SRC_PATH}/source x265 SYSTEM)
-add_dependencies(${CMAKE_PROJECT_NAME} x265-static)
+# --- Multilib 8/10/12-bit x265 for HDR (Main10) ---
+# Use the upstream multilib.sh concept but via CMake ExternalProject for reproducibility
+include(ExternalProject)
 
-# install x265 as a build target, this must be installed before building FFmpeg
-add_custom_target(x265
-        COMMAND ${CMAKE_COMMAND} -P cmake_install.cmake
-        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/x265
-        COMMENT "Installing x265"
+set(X265_MULTILIB_DIR ${CMAKE_CURRENT_BINARY_DIR}/x265-multilib)
+set(X265_8BIT_DIR ${X265_MULTILIB_DIR}/8bit)
+set(X265_10BIT_DIR ${X265_MULTILIB_DIR}/10bit)
+set(X265_12BIT_DIR ${X265_MULTILIB_DIR}/12bit)
+
+# Create combined header that enables multilib API
+# x265 multilib API requires linking all three libs together
+
+ExternalProject_Add(x265-12bit
+  SOURCE_DIR ${X265_GENERATED_SRC_PATH}/source
+  BINARY_DIR ${X265_12BIT_DIR}
+  CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${FFMPEG_INSTALL_PREFIX}
+             -DCMAKE_BUILD_TYPE=Release
+             -DENABLE_CLI=OFF
+             -DENABLE_SHARED=OFF
+             -DSTATIC_LINK_CRT=ON
+             -DHIGH_BIT_DEPTH=ON
+             -DMAIN12=ON
+             -DEXPORT_C_API=OFF
+             -DENABLE_HDR10_PLUS=OFF
+  BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --parallel 4
+  INSTALL_COMMAND ""
+  BUILD_BYPRODUCTS <BINARY_DIR>/libx265.a
 )
-add_dependencies(x265 x265-static)
+
+ExternalProject_Add(x265-10bit
+  SOURCE_DIR ${X265_GENERATED_SRC_PATH}/source
+  BINARY_DIR ${X265_10BIT_DIR}
+  CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${FFMPEG_INSTALL_PREFIX}
+             -DCMAKE_BUILD_TYPE=Release
+             -DENABLE_CLI=OFF
+             -DENABLE_SHARED=OFF
+             -DSTATIC_LINK_CRT=ON
+             -DHIGH_BIT_DEPTH=ON
+             -DEXPORT_C_API=OFF
+             -DENABLE_HDR10_PLUS=OFF
+  DEPENDS x265-12bit
+  BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --parallel 4
+  INSTALL_COMMAND ""
+  BUILD_BYPRODUCTS <BINARY_DIR>/libx265.a
+)
+
+ExternalProject_Add(x265-8bit
+  SOURCE_DIR ${X265_GENERATED_SRC_PATH}/source
+  BINARY_DIR ${X265_8BIT_DIR}
+  CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${FFMPEG_INSTALL_PREFIX}
+             -DCMAKE_BUILD_TYPE=Release
+             -DENABLE_CLI=OFF
+             -DENABLE_SHARED=OFF
+             -DSTATIC_LINK_CRT=ON
+             -DENABLE_HDR10_PLUS=ON
+             -DEXTRA_LIB=x265_main10.a\\;x265_main12.a
+             -DEXTRA_LINK_FLAGS=-L.
+             -DLINKED_10BIT=ON
+             -DLINKED_12BIT=ON
+  DEPENDS x265-10bit x265-12bit
+  BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --parallel 4
+  INSTALL_COMMAND ""
+  BUILD_BYPRODUCTS <BINARY_DIR>/libx265.a
+  # Need to symlink the 10/12-bit libs into 8bit build dir before configuring 8bit
+  PATCH_COMMAND ${CMAKE_COMMAND} -E create_symlink ${X265_10BIT_DIR}/libx265.a ${X265_8BIT_DIR}/libx265_main10.a
+            COMMAND ${CMAKE_COMMAND} -E create_symlink ${X265_12BIT_DIR}/libx265.a ${X265_8BIT_DIR}/libx265_main12.a
+)
+
+# Combine step: after 8bit builds, combine into final libx265.a that supports all bit depths
+add_custom_target(x265-multilib-combine ALL
+  DEPENDS x265-8bit
+  COMMAND ${CMAKE_COMMAND} -E copy ${X265_8BIT_DIR}/libx265.a ${X265_8BIT_DIR}/libx265_main.a
+  COMMAND ar -M < ${CMAKE_CURRENT_SOURCE_DIR}/cmake/ffmpeg/x265-multilib.ar
+  COMMAND ${CMAKE_COMMAND} -E copy ${X265_8BIT_DIR}/libx265.a ${FFMPEG_INSTALL_PREFIX}/lib/libx265.a
+  COMMAND ${CMAKE_COMMAND} -E copy ${X265_GENERATED_SRC_PATH}/source/x265.h ${FFMPEG_INSTALL_PREFIX}/include/x265.h
+  COMMAND ${CMAKE_COMMAND} -E copy ${X265_GENERATED_SRC_PATH}/source/x265_config.h ${FFMPEG_INSTALL_PREFIX}/include/x265_config.h
+  COMMENT "Combining x265 8/10/12-bit into multilib libx265.a"
+  VERBATIM
+)
+
+# Provide x265.pc
+add_custom_target(x265
+  COMMAND ${CMAKE_COMMAND} -E copy ${X265_8BIT_DIR}/x265.pc ${FFMPEG_INSTALL_PREFIX}/lib/pkgconfig/x265.pc
+  DEPENDS x265-multilib-combine
+  COMMENT "Installing x265 pkgconfig"
+)
 add_dependencies(${CMAKE_PROJECT_NAME} x265)
-
-if(ENABLE_HDR10_PLUS)
-    add_dependencies(${CMAKE_PROJECT_NAME} hdr10plus-static)
-    add_dependencies(x265 hdr10plus-static)
-endif()
-
-# PKG_CONFIG_PATH already set since this is installed directly to the prefix
 
 set(CMAKE_INSTALL_PREFIX ${_original_cmake_install_prefix})

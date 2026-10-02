@@ -22,7 +22,7 @@ execute_process(
         ERROR_QUIET
         RESULT_VARIABLE X265_TAG_RESULT
 )
-if(NOT X265_TAG_RESULT EQUAL 0 OR X265_EXPECTED_VERSION STREQUAL "")
+if(NOT X265_TAG_RESULT STREQUAL "0" OR X265_EXPECTED_VERSION STREQUAL "")
     message(FATAL_ERROR "could not determine the x265 version tag in ${X265_SOURCE_DIR}. "
             "x265 only installs x265.pc when it can detect its version, so the tag "
             "lookup is required (see GIT_FETCH_TAGS above).")
@@ -43,8 +43,10 @@ execute_process(
         RESULT_VARIABLE X265_REVISION_RESULT
 )
 # empty values would be written verbatim into x265Version.txt and make x265
-# report "unknown" instead of the tag, so fail before generating the file
-if(NOT X265_TAG_DISTANCE_RESULT EQUAL 0 OR NOT X265_REVISION_RESULT EQUAL 0
+# report "unknown" instead of the tag, so fail before generating the file.
+# STREQUAL is used because RESULT_VARIABLE holds a non-numeric error string when
+# the command cannot be launched at all
+if(NOT X265_TAG_DISTANCE_RESULT STREQUAL "0" OR NOT X265_REVISION_RESULT STREQUAL "0"
         OR X265_TAG_DISTANCE STREQUAL "" OR X265_REVISION_ID STREQUAL "")
     message(FATAL_ERROR "could not determine the x265 version details in "
             "${X265_SOURCE_DIR}; the generated x265Version.txt would be invalid.")
@@ -52,12 +54,20 @@ endif()
 
 set(X265_GENERATED_SRC_PATH "${CMAKE_CURRENT_BINARY_DIR}/FFmpeg/x265_git")
 
+if(NOT EXISTS "${X265_GENERATED_SRC_PATH}/source/CMakeLists.txt")
+    message(FATAL_ERROR "x265 source copy is missing at ${X265_GENERATED_SRC_PATH}")
+endif()
+
 # The patches are applied while the copied tree still carries the submodule's
 # .git file. That pointer is relative to the original location, so git apply
 # cannot use it and exits with an error, which makes APPLY_GIT_PATCH fall back
 # to patch(1). This is deliberate: without the pointer, git apply would resolve
 # the parent repository and silently skip the ignored build tree.
-file(GLOB X265_GIT_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/patches/FFmpeg/x265_git/*.patch")
+set(X265_PATCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/patches/FFmpeg/x265_git")
+file(GLOB X265_GIT_FILES CONFIGURE_DEPENDS "${X265_PATCH_DIR}/*.patch")
+if(NOT X265_GIT_FILES)
+    message(FATAL_ERROR "no x265 patches found in ${X265_PATCH_DIR}")
+endif()
 foreach(patch_file ${X265_GIT_FILES})
     APPLY_GIT_PATCH("${X265_GENERATED_SRC_PATH}" "${patch_file}")
 endforeach()
@@ -67,18 +77,20 @@ endforeach()
 # APPLY_GIT_PATCH only warns when a patch cannot be applied (it is designed to
 # fall back to patch(1) for non-git trees), so verify that every patch is
 # present. patch -R --dry-run succeeds exactly when the tree already contains
-# the patch; without this, a silently skipped patch would only surface as a
-# confusing failure later.
+# the patch; the strip level matches the patch(1) fallback inside
+# APPLY_GIT_PATCH. Without this, a silently skipped patch would only surface as
+# a confusing failure later.
 foreach(patch_file ${X265_GIT_FILES})
     execute_process(
             COMMAND patch -p1 --reverse --dry-run -i "${patch_file}"
             WORKING_DIRECTORY "${X265_GENERATED_SRC_PATH}"
             RESULT_VARIABLE _x265_patch_check
-            OUTPUT_QUIET
-            ERROR_QUIET
+            OUTPUT_VARIABLE _x265_patch_check_output
+            ERROR_VARIABLE _x265_patch_check_error
     )
-    if(NOT _x265_patch_check EQUAL 0)
-        message(FATAL_ERROR "x265 patch was not applied: ${patch_file}")
+    if(NOT _x265_patch_check STREQUAL "0")
+        message(FATAL_ERROR "x265 patch was not applied: ${patch_file}\n"
+                "${_x265_patch_check_output}${_x265_patch_check_error}")
     endif()
 endforeach()
 

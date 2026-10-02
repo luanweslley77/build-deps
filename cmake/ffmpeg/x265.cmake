@@ -33,13 +33,22 @@ execute_process(
         OUTPUT_VARIABLE X265_TAG_DISTANCE
         OUTPUT_STRIP_TRAILING_WHITESPACE
         ERROR_QUIET
+        RESULT_VARIABLE X265_TAG_DISTANCE_RESULT
 )
 execute_process(
         COMMAND git -C "${X265_SOURCE_DIR}" log --pretty=format:%h -n 1
         OUTPUT_VARIABLE X265_REVISION_ID
         OUTPUT_STRIP_TRAILING_WHITESPACE
         ERROR_QUIET
+        RESULT_VARIABLE X265_REVISION_RESULT
 )
+# empty values would be written verbatim into x265Version.txt and make x265
+# report "unknown" instead of the tag, so fail before generating the file
+if(NOT X265_TAG_DISTANCE_RESULT EQUAL 0 OR NOT X265_REVISION_RESULT EQUAL 0
+        OR X265_TAG_DISTANCE STREQUAL "" OR X265_REVISION_ID STREQUAL "")
+    message(FATAL_ERROR "could not determine the x265 version details in "
+            "${X265_SOURCE_DIR}; the generated x265Version.txt would be invalid.")
+endif()
 
 set(X265_GENERATED_SRC_PATH "${CMAKE_CURRENT_BINARY_DIR}/FFmpeg/x265_git")
 
@@ -54,15 +63,24 @@ foreach(patch_file ${X265_GIT_FILES})
 endforeach()
 # Note: the x265 patches also raise the policy range declared by its
 # cmake_minimum_required, which is what lets CMake 4 and newer configure it
-if(NOT EXISTS "${X265_GENERATED_SRC_PATH}/source/CMakeLists.txt")
-    message(FATAL_ERROR "x265 source copy is missing at ${X265_GENERATED_SRC_PATH}")
-endif()
-file(READ "${X265_GENERATED_SRC_PATH}/source/CMakeLists.txt" _x265_cmake_lists)
-if(_x265_cmake_lists MATCHES "cmake_minimum_required \\(VERSION 2\\.8\\.8\\) # OBJECT")
-    message(FATAL_ERROR
-            "the x265 patch that raises the cmake_minimum_required policy range "
-            "was not applied; check the patch fallback in APPLY_GIT_PATCH.")
-endif()
+
+# APPLY_GIT_PATCH only warns when a patch cannot be applied (it is designed to
+# fall back to patch(1) for non-git trees), so verify that every patch is
+# present. patch -R --dry-run succeeds exactly when the tree already contains
+# the patch; without this, a silently skipped patch would only surface as a
+# confusing failure later.
+foreach(patch_file ${X265_GIT_FILES})
+    execute_process(
+            COMMAND patch -p1 --reverse --dry-run -i "${patch_file}"
+            WORKING_DIRECTORY "${X265_GENERATED_SRC_PATH}"
+            RESULT_VARIABLE _x265_patch_check
+            OUTPUT_QUIET
+            ERROR_QUIET
+    )
+    if(NOT _x265_patch_check EQUAL 0)
+        message(FATAL_ERROR "x265 patch was not applied: ${patch_file}")
+    endif()
+endforeach()
 
 # x265 reads its version from git when a .git directory is present and from
 # x265Version.txt otherwise. Now that no consumer needs the copy to look like a
@@ -174,10 +192,6 @@ if("${arch}" STREQUAL "amd64" OR "${arch}" STREQUAL "x86_64")
     set(X265_ENABLE_HDR10_PLUS ON)
 endif()
 
-# GIT_ARCHETYPE is not a real option: x265 hard sets it when it finds .git or
-# x265Version.txt, and the pre-set value is only used when git itself is
-# unavailable. It makes the version file path work on machines without git,
-# mirroring what Gentoo does for the same bug.
 set(X265_CMAKE_ARGS
         -G "${CMAKE_GENERATOR}"
         "-DCMAKE_INSTALL_PREFIX=${FFMPEG_INSTALL_PREFIX}"
@@ -185,7 +199,6 @@ set(X265_CMAKE_ARGS
         -DENABLE_CLI=OFF
         -DENABLE_SHARED=OFF
         -DSTATIC_LINK_CRT=ON
-        -DGIT_ARCHETYPE=1
 )
 
 # forward a variable to the nested builds as a single -D argument; list

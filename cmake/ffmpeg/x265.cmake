@@ -2,8 +2,8 @@
 # expected at fixed paths inside each build directory, and the combine step
 # merges them statically. Multi-config generators (Visual Studio, Xcode) place
 # their outputs in per-config subdirectories and are not supported. Fail before
-# any side effect (tag fetch, .git rewrite, patches). Do not remove this guard
-# without teaching the rules about the per-config paths.
+# any side effect (tag fetch, patches). Do not remove this guard without
+# teaching the rules about the per-config paths.
 if(CMAKE_CONFIGURATION_TYPES)
     message(FATAL_ERROR "x265 multilib requires a single configuration generator")
 endif()
@@ -11,34 +11,51 @@ endif()
 # x265.pc will not be installed if their cmake cannot detect the latest tag
 GIT_FETCH_TAGS("third-party/FFmpeg/x265_git")
 
-set(X265_GENERATED_SRC_PATH "${CMAKE_CURRENT_BINARY_DIR}/FFmpeg/x265_git")
-
-# The copied source tree inherits the submodule's .git file, whose relative
-# gitdir no longer resolves from the new location. Point it at the real git
-# directory so x265 can detect its version tag and install x265.pc (the install
-# step is checked by x265-verify-pc.cmake). This runs before the patch loop so
-# the patches apply through git apply; the source copy itself is made by
-# _main.cmake before this file is included. This couples the build tree to the
-# source repository's Git metadata; passing the version explicitly instead is a
-# possible follow-up.
+# Resolve the tag the submodule is checked out at. This is the single source of
+# truth for the version passed to x265, the version written to x265.pc and the
+# install verification below.
+set(X265_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third-party/FFmpeg/x265_git")
 execute_process(
-        COMMAND git -C "${CMAKE_CURRENT_SOURCE_DIR}/third-party/FFmpeg/x265_git"
-            rev-parse --absolute-git-dir
-        OUTPUT_VARIABLE X265_GIT_DIR
+        COMMAND git -C "${X265_SOURCE_DIR}" describe --abbrev=0 --tags
+        OUTPUT_VARIABLE X265_EXPECTED_VERSION
         OUTPUT_STRIP_TRAILING_WHITESPACE
         ERROR_QUIET
-        RESULT_VARIABLE X265_GIT_RESULT
+        RESULT_VARIABLE X265_TAG_RESULT
 )
-if(X265_GIT_RESULT EQUAL 0)
-    file(WRITE "${X265_GENERATED_SRC_PATH}/.git" "gitdir: ${X265_GIT_DIR}\n")
+if(NOT X265_TAG_RESULT EQUAL 0 OR X265_EXPECTED_VERSION STREQUAL "")
+    message(FATAL_ERROR "could not determine the x265 version tag in ${X265_SOURCE_DIR}. "
+            "x265 only installs x265.pc when it can detect its version, so the tag "
+            "lookup is required (see GIT_FETCH_TAGS above).")
 endif()
 
+set(X265_GENERATED_SRC_PATH "${CMAKE_CURRENT_BINARY_DIR}/FFmpeg/x265_git")
+
+# The patches are applied while the copied tree still carries the submodule's
+# .git file. That pointer is relative to the original location, so git apply
+# cannot use it and exits with an error, which makes APPLY_GIT_PATCH fall back
+# to patch(1). This is deliberate: without the pointer, git apply would resolve
+# the parent repository and silently skip the ignored build tree.
 file(GLOB X265_GIT_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/patches/FFmpeg/x265_git/*.patch")
 foreach(patch_file ${X265_GIT_FILES})
     APPLY_GIT_PATCH("${X265_GENERATED_SRC_PATH}" "${patch_file}")
 endforeach()
 # Note: the x265 patches also raise the policy range declared by its
 # cmake_minimum_required, which is what lets CMake 4 and newer configure it
+if(NOT EXISTS "${X265_GENERATED_SRC_PATH}/source/CMakeLists.txt")
+    message(FATAL_ERROR "x265 source copy is missing at ${X265_GENERATED_SRC_PATH}")
+endif()
+file(READ "${X265_GENERATED_SRC_PATH}/source/CMakeLists.txt" _x265_cmake_lists)
+if(_x265_cmake_lists MATCHES "cmake_minimum_required \\(VERSION 2\\.8\\.8\\) # OBJECT")
+    message(FATAL_ERROR
+            "the x265 patch that raises the cmake_minimum_required policy range "
+            "was not applied; check the patch fallback in APPLY_GIT_PATCH.")
+endif()
+file(READ "${X265_GENERATED_SRC_PATH}/source/cmake/Version.cmake" _x265_version_cmake)
+if(NOT _x265_version_cmake MATCHES "X265_VERSION_OVERRIDE")
+    message(FATAL_ERROR
+            "the x265 patch that adds the version override was not applied; check "
+            "the patch fallback in APPLY_GIT_PATCH.")
+endif()
 
 if(BUILD_FFMPEG_ALL_PATCHES OR BUILD_FFMPEG_X265_PATCHES)
     file(GLOB FFMPEG_X265_FILES "${CMAKE_CURRENT_SOURCE_DIR}/patches/FFmpeg/FFmpeg/x265/*.patch")
@@ -126,6 +143,10 @@ if("${arch}" STREQUAL "amd64" OR "${arch}" STREQUAL "x86_64")
     set(X265_ENABLE_HDR10_PLUS ON)
 endif()
 
+# The version is injected through the patch in patches/FFmpeg/x265_git/
+# 03-version-override.patch, which makes x265's Version.cmake return before any
+# git/hg probing. Each nested build receives the same tag, so all three bit
+# depths (and the installed x265.pc) report the version the sources came from.
 set(X265_CMAKE_ARGS
         -G "${CMAKE_GENERATOR}"
         "-DCMAKE_INSTALL_PREFIX=${FFMPEG_INSTALL_PREFIX}"
@@ -133,6 +154,7 @@ set(X265_CMAKE_ARGS
         -DENABLE_CLI=OFF
         -DENABLE_SHARED=OFF
         -DSTATIC_LINK_CRT=ON
+        "-DX265_VERSION_OVERRIDE=${X265_EXPECTED_VERSION}"
 )
 
 # forward a variable to the nested builds as a single -D argument; list
@@ -395,6 +417,7 @@ add_custom_command(
         COMMAND "${CMAKE_COMMAND}" --install "${X265_8BIT_DIR}" --config Release
         COMMAND "${CMAKE_COMMAND}"
             "-DX265_PC_FILE=${X265_PC_FILE}"
+            "-DX265_EXPECTED_VERSION=${X265_EXPECTED_VERSION}"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ffmpeg/x265-verify-pc.cmake"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${X265_COMBINED_LIB}" "${X265_INSTALL_LIB}"

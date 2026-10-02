@@ -27,6 +27,35 @@ if(NOT X265_TAG_RESULT EQUAL 0 OR X265_EXPECTED_VERSION STREQUAL "")
             "x265 only installs x265.pc when it can detect its version, so the tag "
             "lookup is required (see GIT_FETCH_TAGS above).")
 endif()
+# Resolve the distance from the tag and the revision so the version compiled
+# into the library matches what x265 would report when building from git
+# (x265_version_str); the pkg-config file keeps using the bare tag, as upstream
+# does. Empty values would silently downgrade the reported version, so they
+# abort the configure instead.
+execute_process(
+        COMMAND git -C "${X265_SOURCE_DIR}" rev-list "${X265_EXPECTED_VERSION}.."
+            --count --first-parent
+        OUTPUT_VARIABLE X265_TAG_DISTANCE
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE X265_TAG_DISTANCE_RESULT
+)
+execute_process(
+        COMMAND git -C "${X265_SOURCE_DIR}" log --pretty=format:%h -n 1
+        OUTPUT_VARIABLE X265_REVISION_ID
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE X265_REVISION_RESULT
+)
+if(NOT X265_TAG_DISTANCE_RESULT EQUAL 0 OR NOT X265_REVISION_RESULT EQUAL 0
+        OR X265_TAG_DISTANCE STREQUAL "" OR X265_REVISION_ID STREQUAL "")
+    message(FATAL_ERROR "could not determine the x265 version details in "
+            "${X265_SOURCE_DIR}; the version override would be incomplete.")
+endif()
+set(X265_FULL_VERSION "${X265_EXPECTED_VERSION}")
+if(NOT X265_TAG_DISTANCE STREQUAL "0")
+    set(X265_FULL_VERSION "${X265_EXPECTED_VERSION}+${X265_TAG_DISTANCE}-${X265_REVISION_ID}")
+endif()
 
 set(X265_GENERATED_SRC_PATH "${CMAKE_CURRENT_BINARY_DIR}/FFmpeg/x265_git")
 
@@ -41,21 +70,24 @@ foreach(patch_file ${X265_GIT_FILES})
 endforeach()
 # Note: the x265 patches also raise the policy range declared by its
 # cmake_minimum_required, which is what lets CMake 4 and newer configure it
-if(NOT EXISTS "${X265_GENERATED_SRC_PATH}/source/CMakeLists.txt")
-    message(FATAL_ERROR "x265 source copy is missing at ${X265_GENERATED_SRC_PATH}")
-endif()
-file(READ "${X265_GENERATED_SRC_PATH}/source/CMakeLists.txt" _x265_cmake_lists)
-if(_x265_cmake_lists MATCHES "cmake_minimum_required \\(VERSION 2\\.8\\.8\\) # OBJECT")
-    message(FATAL_ERROR
-            "the x265 patch that raises the cmake_minimum_required policy range "
-            "was not applied; check the patch fallback in APPLY_GIT_PATCH.")
-endif()
-file(READ "${X265_GENERATED_SRC_PATH}/source/cmake/Version.cmake" _x265_version_cmake)
-if(NOT _x265_version_cmake MATCHES "X265_VERSION_OVERRIDE")
-    message(FATAL_ERROR
-            "the x265 patch that adds the version override was not applied; check "
-            "the patch fallback in APPLY_GIT_PATCH.")
-endif()
+
+# APPLY_GIT_PATCH only warns when a patch cannot be applied (it is designed to
+# fall back to patch(1) for non-git trees), so verify that every patch is
+# present. patch -R --dry-run succeeds exactly when the tree already contains
+# the patch; without this, a silently skipped patch would only surface as a
+# confusing failure later.
+foreach(patch_file ${X265_GIT_FILES})
+    execute_process(
+            COMMAND patch -p1 --reverse --dry-run -i "${patch_file}"
+            WORKING_DIRECTORY "${X265_GENERATED_SRC_PATH}"
+            RESULT_VARIABLE _x265_patch_check
+            OUTPUT_QUIET
+            ERROR_QUIET
+    )
+    if(NOT _x265_patch_check EQUAL 0)
+        message(FATAL_ERROR "x265 patch was not applied: ${patch_file}")
+    endif()
+endforeach()
 
 if(BUILD_FFMPEG_ALL_PATCHES OR BUILD_FFMPEG_X265_PATCHES)
     file(GLOB FFMPEG_X265_FILES "${CMAKE_CURRENT_SOURCE_DIR}/patches/FFmpeg/FFmpeg/x265/*.patch")
@@ -145,8 +177,10 @@ endif()
 
 # The version is injected through the patch in patches/FFmpeg/x265_git/
 # 03-version-override.patch, which makes x265's Version.cmake return before any
-# git/hg probing. Each nested build receives the same tag, so all three bit
-# depths (and the installed x265.pc) report the version the sources came from.
+# git/hg probing. X265_VERSION_OVERRIDE carries the full version (tag plus
+# distance/revision when the checkout is ahead of the tag) for the compiled
+# x265_version_str, while X265_LATEST_TAG_OVERRIDE keeps the bare tag in
+# x265.pc, matching x265's own behavior.
 set(X265_CMAKE_ARGS
         -G "${CMAKE_GENERATOR}"
         "-DCMAKE_INSTALL_PREFIX=${FFMPEG_INSTALL_PREFIX}"
@@ -154,7 +188,8 @@ set(X265_CMAKE_ARGS
         -DENABLE_CLI=OFF
         -DENABLE_SHARED=OFF
         -DSTATIC_LINK_CRT=ON
-        "-DX265_VERSION_OVERRIDE=${X265_EXPECTED_VERSION}"
+        "-DX265_VERSION_OVERRIDE=${X265_FULL_VERSION}"
+        "-DX265_LATEST_TAG_OVERRIDE=${X265_EXPECTED_VERSION}"
 )
 
 # forward a variable to the nested builds as a single -D argument; list

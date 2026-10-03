@@ -89,9 +89,9 @@ endif()
 
 # x265's AltiVec primitives for POWER only implement the 8-bit paths (the high
 # bit depth code under common/ppc is incomplete upstream), so the 10/12-bit
-# builds fall back to the generic primitives there
+# builds fall back to the generic primitives on ppc64le
 set(X265_HIGH_DEPTH_ARGS)
-if(${arch} MATCHES "ppc")
+if("${arch}" STREQUAL "ppc64le")
     list(APPEND X265_HIGH_DEPTH_ARGS -DENABLE_ALTIVEC=OFF)
 endif()
 

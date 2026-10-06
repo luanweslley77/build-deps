@@ -1,0 +1,201 @@
+diff --git a/libswscale/format.c b/libswscale/format.c
+index b03cfff44a..520f2e1f96 100644
+--- a/libswscale/format.c
++++ b/libswscale/format.c
+@@ -815,6 +817,10 @@ static FmtInfo fmt_info_irregular(enum AVPixelFormat fmt)
+     case AV_PIX_FMT_X2BGR10LE:
+     case AV_PIX_FMT_X2BGR10BE:
+         return SUBPACKED_FMT(ABGR, 2, 10, 10, 10);
++    case AV_PIX_FMT_BGRA1010102LE:
++        return SUBPACKED_FMT(BGRA, 10, 10, 10, 2);
++    case AV_PIX_FMT_RGBA1010102LE:
++        return SUBPACKED_FMT(RGBA, 10, 10, 10, 2);
+     case AV_PIX_FMT_XV30LE:
+     case AV_PIX_FMT_XV30BE:
+         return SUBPACKED_FMT(AVYU, 2, 10, 10, 10);
+diff --git a/libswscale/uops.c b/libswscale/uops.c
+index 4c37a65829..565ca8bb0d 100644
+--- a/libswscale/uops.c
++++ b/libswscale/uops.c
+@@ -974,6 +974,42 @@ static int free_uop_key(void *opaque, void *key)
+     return 0;
+ }
+ 
++typedef struct MirrorUOps {
++    SwsUOp key;
++    SwsUOp *ops;
++    int num;
++    int cap;
++    int err;
++} MirrorUOps;
++
++static int mirror_uop_cmp(void *opaque, void *elem)
++{
++    const MirrorUOps *m = opaque;
++    const SwsUOp *b = elem;
++    if (m->key.type != b->type)
++        return (int) b->type - m->key.type;
++    if (m->key.uop != b->uop)
++        return (int) b->uop - m->key.uop;
++    return 0;
++}
++
++static int collect_uop(void *opaque, void *elem)
++{
++    MirrorUOps *list = opaque;
++    if (list->num >= list->cap) {
++        const int cap = list->cap ? list->cap * 2 : 32;
++        SwsUOp *ops = av_realloc_array(list->ops, cap, sizeof(*ops));
++        if (!ops) {
++            list->err = 1;
++            return 1; /* stop enumeration */
++        }
++        list->ops = ops;
++        list->cap = cap;
++    }
++    list->ops[list->num++] = *(const SwsUOp *) elem;
++    return 0;
++}
++
+ int ff_sws_uops_macros_gen(char **out_str)
+ {
+     int ret;
+@@ -1029,6 +1065,42 @@ int ff_sws_uops_macros_gen(char **out_str)
+         }
+     }
+ 
++    /**
++     * Permutations and copies are type-agnostic for the template-based
++     * backends, but the enumeration above only registers the combinations that
++     * occur for the format set it was run against. Mirror the integer entries
++     * to float so that float-domain swizzles (e.g. as produced by the optimizer
++     * when it splits a non-diagonal linear operation) can be compiled as well.
++     */
++    for (enum SwsPixelType type = SWS_PIXEL_NONE+1; type < SWS_PIXEL_TYPE_NB; type++) {
++        static const SwsUOpType mirrored[] = { SWS_UOP_PERMUTE, SWS_UOP_COPY };
++
++        if (type == SWS_PIXEL_F32)
++            continue;
++
++        for (int i = 0; i < FF_ARRAY_ELEMS(mirrored); i++) {
++            MirrorUOps list = { .key = { .type = type, .uop = mirrored[i] } };
++
++            av_tree_enumerate(root, &list, mirror_uop_cmp, collect_uop);
++            if (list.err) {
++                av_free(list.ops);
++                ret = AVERROR(ENOMEM);
++                goto fail;
++            }
++
++            for (int j = 0; j < list.num; j++) {
++                list.ops[j].type = SWS_PIXEL_F32;
++                ret = register_uop(&root, &list.ops[j]);
++                if (ret < 0) {
++                    av_free(list.ops);
++                    goto fail;
++                }
++            }
++
++            av_free(list.ops);
++        }
++    }
++
+     #define BPRINT_STR(str) av_bprint_append_data(bp, str, strlen(str))
+     BPRINT_STR(
+ "/**\n"
+diff --git a/libswscale/uops_macros.h b/libswscale/uops_macros.h
+index a382988361..07a1902d97 100644
+--- a/libswscale/uops_macros.h
++++ b/libswscale/uops_macros.h
+@@ -839,24 +839,28 @@
+     MACRO(__VA_ARGS__, u32_to_u16_y                            , SWS_PIXEL_U32, SWS_UOP_TO_U16          , 0x2) \
+     MACRO(__VA_ARGS__, u32_to_u16_z                            , SWS_PIXEL_U32, SWS_UOP_TO_U16          , 0x4) \
+     MACRO(__VA_ARGS__, u32_to_u16_xyz                          , SWS_PIXEL_U32, SWS_UOP_TO_U16          , 0x7) \
+-    MACRO(__VA_ARGS__, u32_to_u16_yzw                          , SWS_PIXEL_U32, SWS_UOP_TO_U16          , 0xe)
++    MACRO(__VA_ARGS__, u32_to_u16_yzw                          , SWS_PIXEL_U32, SWS_UOP_TO_U16          , 0xe) \
++    MACRO(__VA_ARGS__, u32_to_u16_xyzw                         , SWS_PIXEL_U32, SWS_UOP_TO_U16          , 0xf)
+ #define SWS_FOR_STRUCT_U32_TO_U16(MACRO, ...) \
+     MACRO(__VA_ARGS__, u32_to_u16_y                            , .type = SWS_PIXEL_U32, .uop = SWS_UOP_TO_U16          , .mask = 0x2) \
+     MACRO(__VA_ARGS__, u32_to_u16_z                            , .type = SWS_PIXEL_U32, .uop = SWS_UOP_TO_U16          , .mask = 0x4) \
+     MACRO(__VA_ARGS__, u32_to_u16_xyz                          , .type = SWS_PIXEL_U32, .uop = SWS_UOP_TO_U16          , .mask = 0x7) \
+-    MACRO(__VA_ARGS__, u32_to_u16_yzw                          , .type = SWS_PIXEL_U32, .uop = SWS_UOP_TO_U16          , .mask = 0xe)
++    MACRO(__VA_ARGS__, u32_to_u16_yzw                          , .type = SWS_PIXEL_U32, .uop = SWS_UOP_TO_U16          , .mask = 0xe) \
++    MACRO(__VA_ARGS__, u32_to_u16_xyzw                         , .type = SWS_PIXEL_U32, .uop = SWS_UOP_TO_U16          , .mask = 0xf)
+ #define SWS_FOR_U32_TO_U32(MACRO, ...)
+ #define SWS_FOR_STRUCT_U32_TO_U32(MACRO, ...)
+ #define SWS_FOR_U32_TO_F32(MACRO, ...) \
+     MACRO(__VA_ARGS__, u32_to_f32_y                            , SWS_PIXEL_U32, SWS_UOP_TO_F32          , 0x2) \
+     MACRO(__VA_ARGS__, u32_to_f32_z                            , SWS_PIXEL_U32, SWS_UOP_TO_F32          , 0x4) \
+     MACRO(__VA_ARGS__, u32_to_f32_xyz                          , SWS_PIXEL_U32, SWS_UOP_TO_F32          , 0x7) \
+-    MACRO(__VA_ARGS__, u32_to_f32_yzw                          , SWS_PIXEL_U32, SWS_UOP_TO_F32          , 0xe)
++    MACRO(__VA_ARGS__, u32_to_f32_yzw                          , SWS_PIXEL_U32, SWS_UOP_TO_F32          , 0xe) \
++    MACRO(__VA_ARGS__, u32_to_f32_xyzw                         , SWS_PIXEL_U32, SWS_UOP_TO_F32          , 0xf)
+ #define SWS_FOR_STRUCT_U32_TO_F32(MACRO, ...) \
+     MACRO(__VA_ARGS__, u32_to_f32_y                            , .type = SWS_PIXEL_U32, .uop = SWS_UOP_TO_F32          , .mask = 0x2) \
+     MACRO(__VA_ARGS__, u32_to_f32_z                            , .type = SWS_PIXEL_U32, .uop = SWS_UOP_TO_F32          , .mask = 0x4) \
+     MACRO(__VA_ARGS__, u32_to_f32_xyz                          , .type = SWS_PIXEL_U32, .uop = SWS_UOP_TO_F32          , .mask = 0x7) \
+-    MACRO(__VA_ARGS__, u32_to_f32_yzw                          , .type = SWS_PIXEL_U32, .uop = SWS_UOP_TO_F32          , .mask = 0xe)
++    MACRO(__VA_ARGS__, u32_to_f32_yzw                          , .type = SWS_PIXEL_U32, .uop = SWS_UOP_TO_F32          , .mask = 0xe) \
++    MACRO(__VA_ARGS__, u32_to_f32_xyzw                         , .type = SWS_PIXEL_U32, .uop = SWS_UOP_TO_F32          , .mask = 0xf)
+ #define SWS_FOR_U32_SCALE(MACRO, ...) \
+     MACRO(__VA_ARGS__, u32_scale_x                             , SWS_PIXEL_U32, SWS_UOP_SCALE           , 0x1) \
+     MACRO(__VA_ARGS__, u32_scale_xyz                           , SWS_PIXEL_U32, SWS_UOP_SCALE           , 0x7)
+@@ -957,10 +961,54 @@
+ #define SWS_FOR_STRUCT_F32_WRITE_NIBBLE(MACRO, ...)
+ #define SWS_FOR_F32_WRITE_BIT(MACRO, ...)
+ #define SWS_FOR_STRUCT_F32_WRITE_BIT(MACRO, ...)
+-#define SWS_FOR_F32_PERMUTE(MACRO, ...)
+-#define SWS_FOR_STRUCT_F32_PERMUTE(MACRO, ...)
+-#define SWS_FOR_F32_COPY(MACRO, ...)
+-#define SWS_FOR_STRUCT_F32_COPY(MACRO, ...)
++#define SWS_FOR_F32_PERMUTE(MACRO, ...) \
++    MACRO(__VA_ARGS__, f32_permute_xzyw                        , SWS_PIXEL_F32, SWS_UOP_PERMUTE         , 0x0, 0, 2, 1, 3) \
++    MACRO(__VA_ARGS__, f32_permute_xzwy                        , SWS_PIXEL_F32, SWS_UOP_PERMUTE         , 0x0, 0, 2, 3, 1) \
++    MACRO(__VA_ARGS__, f32_permute_xwzy                        , SWS_PIXEL_F32, SWS_UOP_PERMUTE         , 0x0, 0, 3, 2, 1) \
++    MACRO(__VA_ARGS__, f32_permute_yxzw                        , SWS_PIXEL_F32, SWS_UOP_PERMUTE         , 0x0, 1, 0, 2, 3) \
++    MACRO(__VA_ARGS__, f32_permute_yzxw                        , SWS_PIXEL_F32, SWS_UOP_PERMUTE         , 0x0, 1, 2, 0, 3) \
++    MACRO(__VA_ARGS__, f32_permute_yzwx                        , SWS_PIXEL_F32, SWS_UOP_PERMUTE         , 0x0, 1, 2, 3, 0) \
++    MACRO(__VA_ARGS__, f32_permute_ywzx                        , SWS_PIXEL_F32, SWS_UOP_PERMUTE         , 0x0, 1, 3, 2, 0) \
++    MACRO(__VA_ARGS__, f32_permute_zxyw                        , SWS_PIXEL_F32, SWS_UOP_PERMUTE         , 0x0, 2, 0, 1, 3) \
++    MACRO(__VA_ARGS__, f32_permute_zyxw                        , SWS_PIXEL_F32, SWS_UOP_PERMUTE         , 0x0, 2, 1, 0, 3) \
++    MACRO(__VA_ARGS__, f32_permute_zywx                        , SWS_PIXEL_F32, SWS_UOP_PERMUTE         , 0x0, 2, 1, 3, 0) \
++    MACRO(__VA_ARGS__, f32_permute_zwxy                        , SWS_PIXEL_F32, SWS_UOP_PERMUTE         , 0x0, 2, 3, 0, 1) \
++    MACRO(__VA_ARGS__, f32_permute_zwyx                        , SWS_PIXEL_F32, SWS_UOP_PERMUTE         , 0x0, 2, 3, 1, 0) \
++    MACRO(__VA_ARGS__, f32_permute_wxyz                        , SWS_PIXEL_F32, SWS_UOP_PERMUTE         , 0x0, 3, 0, 1, 2) \
++    MACRO(__VA_ARGS__, f32_permute_wxzy                        , SWS_PIXEL_F32, SWS_UOP_PERMUTE         , 0x0, 3, 0, 2, 1) \
++    MACRO(__VA_ARGS__, f32_permute_wyxz                        , SWS_PIXEL_F32, SWS_UOP_PERMUTE         , 0x0, 3, 1, 0, 2) \
++    MACRO(__VA_ARGS__, f32_permute_wyzx                        , SWS_PIXEL_F32, SWS_UOP_PERMUTE         , 0x0, 3, 1, 2, 0) \
++    MACRO(__VA_ARGS__, f32_permute_wzxy                        , SWS_PIXEL_F32, SWS_UOP_PERMUTE         , 0x0, 3, 2, 0, 1) \
++    MACRO(__VA_ARGS__, f32_permute_wzyx                        , SWS_PIXEL_F32, SWS_UOP_PERMUTE         , 0x0, 3, 2, 1, 0)
++#define SWS_FOR_STRUCT_F32_PERMUTE(MACRO, ...) \
++    MACRO(__VA_ARGS__, f32_permute_xzyw                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_PERMUTE         , .mask = 0x0, .par.swizzle.in = {0, 2, 1, 3}) \
++    MACRO(__VA_ARGS__, f32_permute_xzwy                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_PERMUTE         , .mask = 0x0, .par.swizzle.in = {0, 2, 3, 1}) \
++    MACRO(__VA_ARGS__, f32_permute_xwzy                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_PERMUTE         , .mask = 0x0, .par.swizzle.in = {0, 3, 2, 1}) \
++    MACRO(__VA_ARGS__, f32_permute_yxzw                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_PERMUTE         , .mask = 0x0, .par.swizzle.in = {1, 0, 2, 3}) \
++    MACRO(__VA_ARGS__, f32_permute_yzxw                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_PERMUTE         , .mask = 0x0, .par.swizzle.in = {1, 2, 0, 3}) \
++    MACRO(__VA_ARGS__, f32_permute_yzwx                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_PERMUTE         , .mask = 0x0, .par.swizzle.in = {1, 2, 3, 0}) \
++    MACRO(__VA_ARGS__, f32_permute_ywzx                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_PERMUTE         , .mask = 0x0, .par.swizzle.in = {1, 3, 2, 0}) \
++    MACRO(__VA_ARGS__, f32_permute_zxyw                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_PERMUTE         , .mask = 0x0, .par.swizzle.in = {2, 0, 1, 3}) \
++    MACRO(__VA_ARGS__, f32_permute_zyxw                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_PERMUTE         , .mask = 0x0, .par.swizzle.in = {2, 1, 0, 3}) \
++    MACRO(__VA_ARGS__, f32_permute_zywx                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_PERMUTE         , .mask = 0x0, .par.swizzle.in = {2, 1, 3, 0}) \
++    MACRO(__VA_ARGS__, f32_permute_zwxy                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_PERMUTE         , .mask = 0x0, .par.swizzle.in = {2, 3, 0, 1}) \
++    MACRO(__VA_ARGS__, f32_permute_zwyx                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_PERMUTE         , .mask = 0x0, .par.swizzle.in = {2, 3, 1, 0}) \
++    MACRO(__VA_ARGS__, f32_permute_wxyz                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_PERMUTE         , .mask = 0x0, .par.swizzle.in = {3, 0, 1, 2}) \
++    MACRO(__VA_ARGS__, f32_permute_wxzy                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_PERMUTE         , .mask = 0x0, .par.swizzle.in = {3, 0, 2, 1}) \
++    MACRO(__VA_ARGS__, f32_permute_wyxz                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_PERMUTE         , .mask = 0x0, .par.swizzle.in = {3, 1, 0, 2}) \
++    MACRO(__VA_ARGS__, f32_permute_wyzx                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_PERMUTE         , .mask = 0x0, .par.swizzle.in = {3, 1, 2, 0}) \
++    MACRO(__VA_ARGS__, f32_permute_wzxy                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_PERMUTE         , .mask = 0x0, .par.swizzle.in = {3, 2, 0, 1}) \
++    MACRO(__VA_ARGS__, f32_permute_wzyx                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_PERMUTE         , .mask = 0x0, .par.swizzle.in = {3, 2, 1, 0})
++#define SWS_FOR_F32_COPY(MACRO, ...) \
++    MACRO(__VA_ARGS__, f32_copy_yz_xx                          , SWS_PIXEL_F32, SWS_UOP_COPY            , 0x6, 0, 0, 0, 3) \
++    MACRO(__VA_ARGS__, f32_copy_yzw_xxx                        , SWS_PIXEL_F32, SWS_UOP_COPY            , 0xe, 0, 0, 0, 0) \
++    MACRO(__VA_ARGS__, f32_copy_yzw_xxy                        , SWS_PIXEL_F32, SWS_UOP_COPY            , 0xe, 0, 0, 0, 1) \
++    MACRO(__VA_ARGS__, f32_copy_xyzw_yxxx                      , SWS_PIXEL_F32, SWS_UOP_COPY            , 0xf, 1, 0, 0, 0)
++#define SWS_FOR_STRUCT_F32_COPY(MACRO, ...) \
++    MACRO(__VA_ARGS__, f32_copy_yz_xx                          , .type = SWS_PIXEL_F32, .uop = SWS_UOP_COPY            , .mask = 0x6, .par.swizzle.in = {0, 0, 0, 3}) \
++    MACRO(__VA_ARGS__, f32_copy_yzw_xxx                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_COPY            , .mask = 0xe, .par.swizzle.in = {0, 0, 0, 0}) \
++    MACRO(__VA_ARGS__, f32_copy_yzw_xxy                        , .type = SWS_PIXEL_F32, .uop = SWS_UOP_COPY            , .mask = 0xe, .par.swizzle.in = {0, 0, 0, 1}) \
++    MACRO(__VA_ARGS__, f32_copy_xyzw_yxxx                      , .type = SWS_PIXEL_F32, .uop = SWS_UOP_COPY            , .mask = 0xf, .par.swizzle.in = {1, 0, 0, 0})
+ #define SWS_FOR_F32_MOVE(MACRO, ...)
+ #define SWS_FOR_STRUCT_F32_MOVE(MACRO, ...)
+ #define SWS_FOR_F32_SWAP_BYTES(MACRO, ...)
